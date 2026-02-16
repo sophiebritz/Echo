@@ -12,8 +12,8 @@ ESP32-based tracker using rotary encoder attached to rowing machine cable wheel.
 ```
 Rotary Encoder → ESP32
 ─────────────────────────
-SDA (Blue)   → GPIO 21
-SCL (Yellow) → GPIO 22
+SDA (Blue)   → GPIO 10
+SCL (Yellow) → GPIO 08
 VCC (Red)    → 3.3V
 GND (Black)  → GND
 ```
