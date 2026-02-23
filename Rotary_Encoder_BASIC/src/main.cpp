@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <Adafruit_seesaw.h>
+#include <FastLED.h>
 
 // ==================== CONFIGURATION ====================
 #define SDA_PIN 8
@@ -10,16 +11,24 @@
 float METERS_PER_ROTATION = 1.028;
 const float CALORIES_PER_METER = 0.12;
 const int ENCODER_RESOLUTION = 24;
+bool CALIBRATION_MODE = false;  // Set to true to recalibrate
 
-bool CALIBRATION_MODE = false;  // Set to false after calibration
+// ==================== LED RING ====================
+#define NUM_LEDS   12
+#define DATA_PIN   2      // LED ring data pin
+CRGB leds[NUM_LEDS];
+
+// LED colours by effort level
+// Blue = slow warmup, Green = moderate, Yellow = good, Red = max effort
+const CRGB COLOR_SLOW   = CRGB(0,   50,  255);  // Blue
+const CRGB COLOR_MED    = CRGB(0,   255, 50);   // Green
+const CRGB COLOR_FAST   = CRGB(255, 200, 0);    // Yellow
+const CRGB COLOR_MAX    = CRGB(255, 30,  0);    // Red
+const CRGB COLOR_OFF    = CRGB::Black;
 
 // ==================== STROKE DETECTION ====================
-// A stroke is counted when:
-// 1. Encoder moves forward (pull)
-// 2. Then STOPS moving for STROKE_PAUSE_MS milliseconds (return/rest)
-// Adjust STROKE_PAUSE_MS if strokes are over or under counted
-const unsigned long STROKE_PAUSE_MS = 300;   // ms of stillness = end of stroke
-const int32_t MIN_STROKE_PULSES = 6;          // minimum pulses to count as a real stroke
+const unsigned long STROKE_PAUSE_MS = 300;
+const int32_t MIN_STROKE_PULSES = 6;
 
 // ==================== HARDWARE ====================
 Adafruit_seesaw encoder;
@@ -44,13 +53,16 @@ bool sessionActive = false;
 unsigned long lastActivity = 0;
 const unsigned long INACTIVITY_TIMEOUT = 30000;
 
-// Stroke detection
 bool inStroke = false;
 int32_t strokePulses = 0;
 unsigned long lastMovementTime = 0;
 
 unsigned long lastSpeedCheck = 0;
 int32_t lastSpeedPosition = 0;
+float currentSpeedMps = 0;   // current speed in m/s (used for LEDs)
+
+unsigned long lastLedUpdate = 0;
+const unsigned long LED_UPDATE_MS = 50;  // update LEDs every 50ms
 
 // ==================== FUNCTION DECLARATIONS ====================
 void startSession();
@@ -58,14 +70,33 @@ void endSession();
 void printLiveUpdate();
 void printFinalSummary();
 void runCalibration();
+void updateLEDs();
+void setAllLEDs(CRGB color);
+void ledCelebration();
+void ledIdle();
 
 // ==================== SETUP ====================
 void setup() {
   Serial.begin(115200);
   delay(3000);
 
+  // Init LEDs first so we can show status
+  FastLED.addLeds<WS2812, DATA_PIN, GRB>(leds, NUM_LEDS);
+  FastLED.setBrightness(80);
+  FastLED.clear(true);
+
+  // Startup flash - white sweep
+  for (int i = 0; i < NUM_LEDS; i++) {
+    leds[i] = CRGB::White;
+    FastLED.show();
+    delay(40);
+  }
+  FastLED.clear(true);
+  FastLED.show();
+
   Serial.println("\n\n╔════════════════════════════════════════╗");
-  Serial.println("║   ROWING MACHINE MONITOR v1.0          ║");
+  Serial.println("║   ROWING MACHINE MONITOR v2.0          ║");
+  Serial.println("║   With LED Ring Feedback               ║");
   Serial.println("╚════════════════════════════════════════╝\n");
 
   Wire.begin(SDA_PIN, SCL_PIN);
@@ -75,6 +106,9 @@ void setup() {
   Serial.print("🔍 Looking for encoder...");
   if (!encoder.begin(0x36)) {
     Serial.println(" ❌ FAILED!");
+    // Flash red to show error
+    setAllLEDs(CRGB::Red);
+    FastLED.show();
     Serial.println("\nCheck wiring!");
     while(1) delay(1000);
   }
@@ -87,6 +121,7 @@ void setup() {
     return;
   }
 
+  // Idle breathing blue to show ready
   Serial.println("╔════════════════════════════════════════╗");
   Serial.println("║  🚣 READY! START ROWING...             ║");
   Serial.println("╚════════════════════════════════════════╝\n");
@@ -98,34 +133,30 @@ void loop() {
   int32_t currentPosition = encoder.getEncoderPosition();
 
   if (currentPosition != lastPosition) {
-    // Auto-start session on first movement
     if (!sessionActive) {
       startSession();
     }
 
     int32_t delta = currentPosition - lastPosition;
 
-    // Only care about forward movement (encoder only goes one way)
     if (delta > 0) {
-      // Accumulate distance
       float rotations = (float)delta / ENCODER_RESOLUTION;
       float newDistance = rotations * METERS_PER_ROTATION;
       currentSession.distance += newDistance;
       currentSession.totalPulses += delta;
 
-      // Accumulate stroke pulses
       strokePulses += delta;
       inStroke = true;
       lastMovementTime = currentMillis;
 
-      // Speed tracking
+      // Update speed every second
       if (currentMillis - lastSpeedCheck >= 1000) {
         int32_t speedDelta = abs(currentPosition - lastSpeedPosition);
         float speedRotations = (float)speedDelta / ENCODER_RESOLUTION;
-        float currentSpeed = speedRotations * METERS_PER_ROTATION;
+        currentSpeedMps = speedRotations * METERS_PER_ROTATION;
 
-        if (currentSpeed > currentSession.maxSpeed) {
-          currentSession.maxSpeed = currentSpeed;
+        if (currentSpeedMps > currentSession.maxSpeed) {
+          currentSession.maxSpeed = currentSpeedMps;
         }
 
         lastSpeedCheck = currentMillis;
@@ -138,7 +169,7 @@ void loop() {
     lastActivity = currentMillis;
 
   } else if (inStroke && (currentMillis - lastMovementTime >= STROKE_PAUSE_MS)) {
-    // Encoder STOPPED after a pull = complete stroke!
+    // Encoder stopped = complete stroke
     if (strokePulses >= MIN_STROKE_PULSES) {
       currentSession.strokes++;
 
@@ -146,9 +177,11 @@ void loop() {
         printLiveUpdate();
       }
     }
-    // Reset for next stroke
     inStroke = false;
     strokePulses = 0;
+
+    // Fade speed down when not actively pulling
+    currentSpeedMps *= 0.7;
   }
 
   if (sessionActive) {
@@ -161,7 +194,83 @@ void loop() {
     endSession();
   }
 
+  // Update LEDs regularly
+  if (currentMillis - lastLedUpdate >= LED_UPDATE_MS) {
+    updateLEDs();
+    lastLedUpdate = currentMillis;
+  }
+
   delay(10);
+}
+
+// ==================== LED FEEDBACK ====================
+void updateLEDs() {
+  if (!sessionActive) {
+    // Idle: slow breathing blue pulse
+    static uint8_t breath = 0;
+    static int8_t dir = 1;
+    breath += dir * 2;
+    if (breath >= 80) dir = -1;
+    if (breath <= 5) dir = 1;
+    
+    for (int i = 0; i < NUM_LEDS; i++) {
+      leds[i] = CRGB(0, 0, breath);
+    }
+    FastLED.show();
+    return;
+  }
+
+  // Map speed to number of LEDs lit (0 - 12)
+  // Max expected speed ~4 m/s = all 12 LEDs
+  float maxSpeed = 4.0;
+  int numLit = (int)((currentSpeedMps / maxSpeed) * NUM_LEDS);
+  if (numLit > NUM_LEDS) numLit = NUM_LEDS;
+  if (numLit < 0) numLit = 0;
+
+  // Choose colour based on effort
+  CRGB color;
+  if (numLit <= 3) {
+    color = COLOR_SLOW;    // Blue - slow/warmup
+  } else if (numLit <= 6) {
+    color = COLOR_MED;     // Green - moderate
+  } else if (numLit <= 9) {
+    color = COLOR_FAST;    // Yellow - good pace
+  } else {
+    color = COLOR_MAX;     // Red - max effort!
+  }
+
+  // Fill LEDs in ring
+  fill_solid(leds, NUM_LEDS, COLOR_OFF);
+  for (int i = 0; i < numLit; i++) {
+    leds[i] = color;
+  }
+
+  // Always show at least 1 dim LED during session
+  if (numLit == 0 && sessionActive) {
+    leds[0] = CRGB(0, 20, 60);
+  }
+
+  FastLED.show();
+}
+
+void setAllLEDs(CRGB color) {
+  fill_solid(leds, NUM_LEDS, color);
+  FastLED.show();
+}
+
+void ledCelebration() {
+  // Rainbow spin around the ring
+  for (int round = 0; round < 3; round++) {
+    for (int i = 0; i < NUM_LEDS; i++) {
+      fill_solid(leds, NUM_LEDS, COLOR_OFF);
+      leds[i] = CHSV((i * 255 / NUM_LEDS), 255, 255);
+      leds[(i + 1) % NUM_LEDS] = CHSV(((i+1) * 255 / NUM_LEDS), 200, 180);
+      FastLED.show();
+      delay(60);
+    }
+  }
+  FastLED.clear(true);
+  FastLED.show();
 }
 
 // ==================== SESSIONS ====================
@@ -175,31 +284,46 @@ void startSession() {
   currentSession = {0, 0, 0, 0, 0, 0, 0};
   inStroke = false;
   strokePulses = 0;
+  currentSpeedMps = 0;
 
   lastPosition = encoder.getEncoderPosition();
   lastSpeedPosition = lastPosition;
   encoder.setEncoderPosition(0);
 
+  // Flash green to signal session start
+  setAllLEDs(CRGB::Green);
+  delay(300);
+  FastLED.clear(true);
+  FastLED.show();
+
   Serial.println("\n╔════════════════════════════════════════╗");
   Serial.println("║       🚣 SESSION STARTED!              ║");
   Serial.println("╚════════════════════════════════════════╝\n");
   Serial.println("Live updates every 10 strokes...\n");
+  Serial.println("LED GUIDE:");
+  Serial.println("  🔵 Blue  = Slow/Warmup");
+  Serial.println("  🟢 Green = Moderate pace");
+  Serial.println("  🟡 Yellow = Good pace");
+  Serial.println("  🔴 Red   = Max effort!\n");
 }
 
 void endSession() {
-  // Count any in-progress stroke
   if (inStroke && strokePulses >= MIN_STROKE_PULSES) {
     currentSession.strokes++;
   }
   inStroke = false;
   strokePulses = 0;
   sessionActive = false;
+  currentSpeedMps = 0;
 
   if (currentSession.strokes > 0) {
     currentSession.avgStrokeDistance = currentSession.distance / currentSession.strokes;
   }
 
   printFinalSummary();
+
+  // Celebration LEDs!
+  ledCelebration();
 
   delay(3000);
   Serial.println("\n✅ Ready for next session - start rowing!\n");
@@ -210,8 +334,9 @@ void printLiveUpdate() {
   int m = currentSession.duration / 60;
   int s = currentSession.duration % 60;
 
-  Serial.printf("⚡ %3d strokes | %6.1f m | %d:%02d | %5.1f kcal\n",
-                currentSession.strokes, currentSession.distance, m, s, currentSession.calories);
+  Serial.printf("⚡ %3d strokes | %6.1f m | %d:%02d | %5.1f kcal | %.1f m/s\n",
+                currentSession.strokes, currentSession.distance, m, s,
+                currentSession.calories, currentSpeedMps);
 }
 
 void printFinalSummary() {
@@ -249,14 +374,18 @@ void runCalibration() {
   Serial.println("╔════════════════════════════════════════════════════╗");
   Serial.println("║          🎯 CALIBRATION MODE                       ║");
   Serial.println("╚════════════════════════════════════════════════════╝\n");
-  Serial.println("Get ready to row exactly 10 complete strokes.");
-  Serial.println("Pull the cable fully, let it return, repeat.\n");
+  Serial.println("Row exactly 10 complete strokes then wait.\n");
+
+  // Yellow LEDs during calibration
+  setAllLEDs(CRGB::Yellow);
 
   for (int i = 5; i > 0; i--) {
     Serial.printf("Starting in %d seconds...\n", i);
     delay(1000);
   }
 
+  // Green = go!
+  setAllLEDs(CRGB::Green);
   Serial.println("\n🚣 START ROWING NOW! (10 strokes)\n");
 
   encoder.setEncoderPosition(0);
@@ -274,10 +403,23 @@ void runCalibration() {
       pulling = true;
       pulses += delta;
       lastMove = millis();
+
+      // Light up LEDs as you pull
+      int lit = map(strokeCount, 0, 10, 0, NUM_LEDS);
+      fill_solid(leds, NUM_LEDS, COLOR_OFF);
+      for (int i = 0; i < lit; i++) leds[i] = CRGB::Green;
+      FastLED.show();
+
     } else if (pulling && (millis() - lastMove >= STROKE_PAUSE_MS)) {
       if (pulses >= MIN_STROKE_PULSES) {
         strokeCount++;
         Serial.printf("  ✓ Stroke %d complete (pulses: %d)\n", strokeCount, pulses);
+
+        // Update LEDs to show progress
+        fill_solid(leds, NUM_LEDS, COLOR_OFF);
+        int lit = map(strokeCount, 0, 10, 0, NUM_LEDS);
+        for (int i = 0; i < lit; i++) leds[i] = CRGB::Blue;
+        FastLED.show();
       }
       pulling = false;
       pulses = 0;
@@ -291,6 +433,12 @@ void runCalibration() {
   float rots = (float)totalPulses / ENCODER_RESOLUTION;
   float value = 20.0 / rots;
 
+  // Flash white = done!
+  setAllLEDs(CRGB::White);
+  delay(500);
+  FastLED.clear(true);
+  FastLED.show();
+
   Serial.println("\n╔════════════════════════════════════════════════════╗");
   Serial.println("║          📊 CALIBRATION RESULTS                    ║");
   Serial.println("╠════════════════════════════════════════════════════╣");
@@ -298,7 +446,7 @@ void runCalibration() {
   Serial.printf( "║ Rotations:      %-8.2f                             ║\n", rots);
   Serial.println("╚════════════════════════════════════════════════════╝\n");
 
-  Serial.println("🎯 UPDATE YOUR CODE WITH THESE VALUES:");
+  Serial.println("🎯 UPDATE YOUR CODE:");
   Serial.println("════════════════════════════════════════");
   Serial.printf( "  METERS_PER_ROTATION = %.3f;\n", value);
   Serial.println("  CALIBRATION_MODE = false;");
